@@ -1,0 +1,54 @@
+# ============================================================
+# Posterior Blindness Experiment — Default Hyperparameters
+# ============================================================
+
+# --- Data ---
+dataset: cifar10
+num_classes: 10
+train_size: 40000
+holdout_size: 5000
+calibration_size: 5000
+data_dir: ./data/raw
+results_dir: ./results
+checkpoints_dir: ./checkpoints
+
+# --- Backbone ---
+# Options: resnet20 (dissertation main, §4.2.1), resnet18, wrn28_10.
+backbone: resnet20
+epochs: 200
+batch_size: 128
+lr: 0.1
+momentum: 0.9
+weight_decay: 0.0005
+scheduler: cosine
+seed: 42
+
+# --- MC-Dropout ---
+dropout_rate: 0.1
+mc_samples: 30
+
+# --- Last-Layer SWAG ---
+swag:
+  swa_lr: 0.01          # SWA 阶段的恒定学习率
+  swa_epochs: 40         # SWA 收集 epoch 数
+  max_rank: 20           # 低秩近似的最大秩
+  collect_freq: 1        # 每几个 epoch 收集一次快照
+  n_samples: 30          # 推理时采样次数
+  scale: 1.0             # 采样方差缩放因子
+
+# --- Conformal ---
+alpha: 0.1          # miscoverage level (target coverage = 1 - alpha = 90%)
+score_function: APS
+
+# --- B_local Audit ---
+# k = 50 in the main experiments (Dissertation §4.1).
+k_neighbors: 50
+# tau_b is calibrated by Youden's J on the hold-out LOO ROC.
+# d_max is the 95th percentile of hold-out LOO k-NN distances.
+# Both are fully data-driven — no hard-coded thresholds.
+
+# --- Evaluation ---
+n_buckets: 5
+ood_dataset: svhn
+cifar10c_severities: [1, 2, 3, 4, 5]
+cifar10c_dir: ./data/raw/CIFAR-10-C
