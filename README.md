@@ -1,6 +1,6 @@
 # Code submission — *The Structural Barrier to Pointwise Risk Assessment in Bayesian and Conformal Prediction*
 
-Candidate Number: **1099874** · Master of Science Thesis · Trinity 2026 · St Hilda's College.
+Candidate Number: **1099874** · Master of Science Thesis · Trinity 2026
 
 This package contains the code that produced every figure and table reported in
 the dissertation. The repository is organised so that each numbered figure or
