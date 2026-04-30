@@ -10,7 +10,7 @@ table maps onto a single, self-contained entry-point script under
 `core/` and the supporting model / data / inference utilities live in
 `utils/`. The LLM experiments have their own subdirectory (`llm/`).
 
-## What this thesis is about, in one picture
+## Overview at a glance
 
 Bayesian posterior summaries and model-based conformal prediction sets both
 depend on the same fitted predictive law $p_{\theta^*}(y \mid x)$ — so the
