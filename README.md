@@ -10,6 +10,23 @@ table maps onto a single, self-contained entry-point script under
 `core/` and the supporting model / data / inference utilities live in
 `utils/`. The LLM experiments have their own subdirectory (`llm/`).
 
+## What this thesis is about, in one picture
+
+Bayesian posterior summaries and model-based conformal prediction sets both
+depend on the same fitted predictive law $p_{\theta^*}(y \mid x)$ — so the
+pointwise risk gap $B_\ell(x_0)$ induced by local misspecification is a
+*common* blind spot of the two paradigms (Fig 1.1).
+
+![Shared structural barrier (Fig 1.1)](figures/fig1_1_structure_barrier.png)
+
+To bypass that blind spot we propose a two-stage deployment protocol
+(Fig 3.2): Stage 1 abstains on inputs with high uncertainty $U(x)$;
+Stage 2 audits the remaining confident tier with the k-NN local estimator
+$\widehat{B}_{\mathrm{local}}(x_0)$, flagging blindspots and
+insufficient-data inputs.
+
+![Two-stage deployment protocol (Fig 3.2)](figures/fig3_2_two_stage_pipeline.png)
+
 ---
 
 ## 1. Repository layout
