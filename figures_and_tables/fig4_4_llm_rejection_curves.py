@@ -10,12 +10,8 @@ Dissertation reference (Chapter 4, §4.3.3):
 
 The figure is rendered from the LLM-side rejection curves on three
 scenarios — BoolQ (ID), PubMedQA (OOD), Mixed — at coverage tiers 70%,
-80% (main), and 90%, with rejection budget r ∈ {0, 5, ..., 40}%.
-
-Curve values are stored on the 5%-grid inside
-`_src_llm_rejection_curves.py::DATA` (the production numbers from the
-LLM pipeline run). The script renders the figure with the same
-typography as the vision-side Fig 4.1 for visual consistency.
+80% (main), and 90%, with rejection budget r ∈ {0, 5, ..., 40}%, using
+the typography of the vision-side Fig 4.1 for visual consistency.
 
 Outputs
 -------

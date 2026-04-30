@@ -1,21 +1,24 @@
 """
 swag.py
 -------
-Last-Layer SWAG (Stochastic Weight Averaging - Gaussian) 推理。
+Last-Layer SWAG (Stochastic Weight Averaging - Gaussian) inference.
 
-SWAG 在训练末期（SWA 阶段）收集最后一层权重的快照，
-拟合低秩 + 对角高斯分布，推理时从该分布采样做贝叶斯预测。
+SWAG collects last-layer weight snapshots during the SWA phase, fits a
+low-rank + diagonal Gaussian to them, and at inference time samples from
+that Gaussian to obtain a Bayesian predictive.
 
-两步流程：
-  1. swag_train:  在 backbone_single 基础上继续训练（高恒定 LR + 收集快照）
-  2. swag_predict: 从拟合的高斯中采样权重，多次前向传播取均值
+Two-step workflow:
+  1. swag_train  : continue training on top of backbone_single with a
+                   high constant LR while collecting snapshots.
+  2. swag_predict: draw weight samples from the fitted Gaussian and
+                   average several forward passes.
 
-用法：
-    # 步骤 1: SWAG 收集（基于已训练的 backbone_single）
-    python methods/swag.py --config configs/default.yaml --mode train
+Usage:
+    # Step 1: SWAG collection (assumes backbone_single is trained)
+    python utils/swag.py --config configs/default.yaml --mode train
 
-    # 步骤 2: SWAG 推理
-    python methods/swag.py --config configs/default.yaml --mode predict
+    # Step 2: SWAG inference
+    python utils/swag.py --config configs/default.yaml --mode predict
 """
 
 import argparse
@@ -30,8 +33,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.splits import get_loaders, get_ood_loader
-from models.backbone import load_model, build_model
+from utils.splits import get_loaders, get_ood_loader
+from utils.backbone import load_model, build_model
 
 
 def load_config(path: str) -> dict:
@@ -44,19 +47,19 @@ def entropy(probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------ #
-#  Last-Layer SWAG 收集器                                              #
+#  Last-Layer SWAG collector                                          #
 # ------------------------------------------------------------------ #
 
 class LastLayerSWAG:
-    """
-    只对最后一层 (fc) 收集 SWAG 统计量。
+    """Collect SWAG statistics on the last (fc) layer only.
 
-    收集内容：
-      - θ̄   : SWA 均值权重（running mean）
-      - Σ_diag : 对角方差（running second moment - mean²）
-      - D_cols : 低秩偏差矩阵的列（最近 K 个快照与均值的偏差）
+    Tracked quantities:
+      - θ̄      : SWA running mean of the weights.
+      - Σ_diag  : diagonal variance (running second moment - mean²).
+      - D_cols  : columns of the low-rank deviation matrix (the most
+                  recent K snapshots minus the running mean).
 
-    推理时采样：
+    At inference time, sampling is:
       θ ~ θ̄ + (1/√2) * Σ_diag^{1/2} * z₁ + (1/√(2(K-1))) * D * z₂
     """
 
@@ -64,35 +67,35 @@ class LastLayerSWAG:
         self.base_model = base_model
         self.max_rank = max_rank
 
-        # 提取最后一层参数的引用
+        # Reference to the last-layer parameters
         fc = self._get_fc(base_model)
         self.fc_weight_shape = fc.weight.shape
         self.fc_bias_shape = fc.bias.shape if fc.bias is not None else None
 
-        # SWA 统计
+        # SWA statistics
         self.n_snapshots = 0
         self.mean_w = torch.zeros_like(fc.weight.data).cpu()
         self.sq_mean_w = torch.zeros_like(fc.weight.data).cpu()
         self.mean_b = torch.zeros_like(fc.bias.data).cpu() if fc.bias is not None else None
         self.sq_mean_b = torch.zeros_like(fc.bias.data).cpu() if fc.bias is not None else None
 
-        # 低秩偏差列
+        # Low-rank deviation columns
         self.dev_w = []  # list of (flattened) weight deviations
         self.dev_b = []  # list of bias deviations
 
     @staticmethod
     def _get_fc(model: nn.Module) -> nn.Linear:
-        """获取模型的最后线性层。"""
+        """Return the model's final linear layer."""
         fc = model.fc
         if isinstance(fc, nn.Sequential):
-            # MC-Dropout 模型: Sequential(Dropout, Linear)
+            # MC-Dropout model: Sequential(Dropout, Linear)
             for m in fc:
                 if isinstance(m, nn.Linear):
                     return m
         return fc
 
     def collect_snapshot(self):
-        """在每个 SWA epoch 结束后调用，收集最后一层权重快照。"""
+        """Call after each SWA epoch to take a last-layer weight snapshot."""
         fc = self._get_fc(self.base_model)
         w = fc.weight.data.cpu().clone()
         b = fc.bias.data.cpu().clone() if fc.bias is not None else None
@@ -100,26 +103,26 @@ class LastLayerSWAG:
         self.n_snapshots += 1
         n = self.n_snapshots
 
-        # 在线更新均值和平方均值
+        # Online update of the mean and the second moment
         self.mean_w = self.mean_w + (w - self.mean_w) / n
         self.sq_mean_w = self.sq_mean_w + (w ** 2 - self.sq_mean_w) / n
         if b is not None:
             self.mean_b = self.mean_b + (b - self.mean_b) / n
             self.sq_mean_b = self.sq_mean_b + (b ** 2 - self.sq_mean_b) / n
 
-        # 低秩偏差（相对于当前均值的偏差）
+        # Low-rank deviation (relative to the current mean)
         self.dev_w.append((w - self.mean_w).flatten())
         if b is not None:
             self.dev_b.append(b - self.mean_b)
 
-        # 限制最大秩
+        # Cap the rank
         if len(self.dev_w) > self.max_rank:
             self.dev_w.pop(0)
             if self.dev_b:
                 self.dev_b.pop(0)
 
     def _diag_var(self):
-        """对角方差 = E[w²] - E[w]²，clamp ≥ 0。"""
+        """Diagonal variance = E[w²] - E[w]², clamped ≥ 0."""
         var_w = (self.sq_mean_w - self.mean_w ** 2).clamp(min=1e-10)
         var_b = None
         if self.mean_b is not None:
@@ -128,25 +131,24 @@ class LastLayerSWAG:
 
     @torch.no_grad()
     def sample_and_set(self, scale: float = 1.0):
-        """
-        从 SWAG 后验采样一组最后一层权重，并设置到 base_model 中。
-        scale: 采样方差的缩放因子（默认 1.0）。
-        """
+        """Sample one set of last-layer weights from the SWAG posterior
+        and write them into base_model.
+        scale: scaling factor on the sampling variance (default 1.0)."""
         var_w, var_b = self._diag_var()
         K = len(self.dev_w)
 
-        # 对角部分采样（全在 CPU 上计算，最后拷贝到 device）
+        # Diagonal part (computed on CPU, copied to device at the end)
         z1_w = torch.randn_like(self.mean_w)
         w_sample = self.mean_w + scale * (1.0 / np.sqrt(2.0)) * var_w.sqrt() * z1_w
 
-        # 低秩部分采样
+        # Low-rank part
         if K > 1:
             z2 = torch.randn(K, device="cpu")
             D_w = torch.stack(self.dev_w, dim=0)  # (K, d) on CPU
             lr_w = (scale / np.sqrt(2.0 * (K - 1))) * (z2 @ D_w)
             w_sample = w_sample + lr_w.view_as(self.mean_w)
 
-        # 设置到模型
+        # Write to the model
         fc = self._get_fc(self.base_model)
         fc.weight.data.copy_(w_sample.to(fc.weight.device))
 
@@ -160,7 +162,7 @@ class LastLayerSWAG:
             fc.bias.data.copy_(b_sample.to(fc.bias.device))
 
     def set_swa_mean(self):
-        """将最后一层权重设为 SWA 均值（用于 BN 更新等）。"""
+        """Set the last-layer weights to the SWA mean (e.g. for BN updates)."""
         fc = self._get_fc(self.base_model)
         fc.weight.data.copy_(self.mean_w.to(fc.weight.device))
         if self.mean_b is not None:
@@ -190,18 +192,17 @@ class LastLayerSWAG:
 
 
 # ------------------------------------------------------------------ #
-#  SWAG 训练（在已训练 backbone 基础上继续）                            #
+#  SWAG training (continuation on top of an already trained backbone) #
 # ------------------------------------------------------------------ #
 
 def swag_train(cfg: dict, root: str, device="cuda"):
-    """
-    加载已训练的 backbone_single，用高恒定学习率继续训练最后几个 epoch，
-    每个 epoch 结束后收集最后一层权重快照。
-    """
+    """Load backbone_single, continue training the last layer with a high
+    constant LR, and snapshot the weights at the end of each epoch."""
     ckpt_path = os.path.join(root, cfg.get("checkpoints_dir", "./checkpoints"),
                               "backbone_single.pt")
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"未找到 {ckpt_path}。请先训练 backbone_single。")
+        raise FileNotFoundError(f"Could not find {ckpt_path}. "
+                                f"Train backbone_single first.")
 
     model = load_model(ckpt_path, device)
     model.train()
@@ -210,15 +211,15 @@ def swag_train(cfg: dict, root: str, device="cuda"):
     swa_lr = swag_cfg.get("swa_lr", 0.01)
     swa_epochs = swag_cfg.get("swa_epochs", 40)
     max_rank = swag_cfg.get("max_rank", 20)
-    collect_freq = swag_cfg.get("collect_freq", 1)  # 每几个 epoch 收集一次
+    collect_freq = swag_cfg.get("collect_freq", 1)  # snapshot every N epochs
 
-    print(f"SWAG 训练: swa_lr={swa_lr}, swa_epochs={swa_epochs}, "
+    print(f"SWAG training: swa_lr={swa_lr}, swa_epochs={swa_epochs}, "
           f"max_rank={max_rank}, collect_freq={collect_freq}")
 
     loaders = get_loaders(cfg, root)
     criterion = nn.CrossEntropyLoss()
 
-    # 只优化最后一层（last-layer SWAG）
+    # Optimise the last layer only (last-layer SWAG)
     fc = LastLayerSWAG._get_fc(model)
     optimizer = torch.optim.SGD(
         fc.parameters(),
@@ -253,9 +254,9 @@ def swag_train(cfg: dict, root: str, device="cuda"):
             print(f"  Epoch {epoch:3d}/{swa_epochs} | "
                   f"Loss {total_loss/total:.4f} Acc {acc:.2f}%{tag}")
 
-    print(f"共收集 {swag.n_snapshots} 个快照")
+    print(f"Collected {swag.n_snapshots} snapshots in total.")
 
-    # 保存 SWAG 状态 + 基础模型
+    # Save SWAG state + base model
     save_dir = os.path.join(root, cfg.get("checkpoints_dir", "./checkpoints"))
     save_path = os.path.join(save_dir, "swag_last_layer.pt")
     torch.save({
@@ -263,28 +264,27 @@ def swag_train(cfg: dict, root: str, device="cuda"):
         "swag_state": swag.state_dict(),
         "cfg": cfg,
     }, save_path)
-    print(f"SWAG 模型已保存: {save_path}")
+    print(f"SWAG model saved: {save_path}")
     return save_path
 
 
 # ------------------------------------------------------------------ #
-#  SWAG 推理                                                          #
+#  SWAG inference                                                     #
 # ------------------------------------------------------------------ #
 
 @torch.no_grad()
 def predict_swag(model, swag: LastLayerSWAG, loader, n_samples: int = 30,
                  scale: float = 1.0, device="cuda") -> dict:
-    """
-    从 SWAG 后验采样 n_samples 组权重，每组做一次前向传播，取均值。
-    输出格式与 LLLA / MC-Dropout 一致。
-    """
+    """Sample n_samples sets of last-layer weights from the SWAG posterior,
+    do one forward pass per sample, and average the predictions.
+    Output schema matches LLLA / MC-Dropout."""
     model.to(device)
     model.eval()
 
     all_sample_probs = []
     all_labels = []
 
-    # 先收集所有输入
+    # Collect all inputs first
     inputs, labels_list = [], []
     for x, y in loader:
         inputs.append(x)
@@ -292,9 +292,9 @@ def predict_swag(model, swag: LastLayerSWAG, loader, n_samples: int = 30,
     all_x = torch.cat(inputs, dim=0)
     all_y = torch.cat(labels_list, dim=0)
 
-    # n_samples 次采样
+    # n_samples weight draws
     all_probs = []
-    for s in tqdm(range(n_samples), desc=f"SWAG 采样({n_samples}次)"):
+    for s in tqdm(range(n_samples), desc=f"SWAG samples ({n_samples})"):
         swag.sample_and_set(scale=scale)
         model.eval()
 
@@ -306,7 +306,7 @@ def predict_swag(model, swag: LastLayerSWAG, loader, n_samples: int = 30,
         probs_s = torch.cat(batch_probs, dim=0)  # (N, C)
         all_probs.append(probs_s)
 
-    # 恢复 SWA 均值
+    # Restore the SWA mean
     swag.set_swa_mean()
 
     probs_stack = torch.stack(all_probs, dim=1)  # (N, n_samples, C)
@@ -334,18 +334,18 @@ def save_results(results: dict, root: str, split: str):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"{split}.pt")
     torch.save(results, path)
-    print(f"SWAG 结果已保存: {path}")
+    print(f"SWAG results saved: {path}")
 
 
 # ------------------------------------------------------------------ #
-#  主入口                                                              #
+#  Main entry point                                                   #
 # ------------------------------------------------------------------ #
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--mode", choices=["train", "predict", "all"], default="all",
-                        help="train: SWAG 收集; predict: 推理; all: 两步都做")
+                        help="train: SWAG collection; predict: inference; all: both.")
     args = parser.parse_args()
 
     config_path = args.config
@@ -362,13 +362,14 @@ def main():
                               "swag_last_layer.pt")
 
     if args.mode in ("train", "all"):
-        print("=== SWAG 训练（收集最后一层权重快照）===")
+        print("=== SWAG training (last-layer weight snapshots) ===")
         swag_train(cfg, root, device)
 
     if args.mode in ("predict", "all"):
-        print("\n=== SWAG 推理 ===")
+        print("\n=== SWAG inference ===")
         if not os.path.exists(swag_ckpt):
-            raise FileNotFoundError(f"未找到 {swag_ckpt}。请先运行 --mode train。")
+            raise FileNotFoundError(f"Could not find {swag_ckpt}. "
+                                    f"Run --mode train first.")
 
         ckpt = torch.load(swag_ckpt, map_location=device, weights_only=False)
         model = build_model(ckpt["cfg"]).to(device)
@@ -382,20 +383,20 @@ def main():
         scale = cfg.get("swag", {}).get("scale", 1.0)
 
         for split in ["holdout", "calibration", "test_id"]:
-            print(f"\n--- SWAG 预测 [{split}] ---")
+            print(f"\n--- SWAG predict [{split}] ---")
             results = predict_swag(model, swag, loaders[split],
                                    n_samples=n_samples, scale=scale, device=device)
             save_results(results, root, split)
             acc = results["correct"].float().mean() * 100
-            print(f"  准确率: {acc:.2f}%")
+            print(f"  accuracy: {acc:.2f}%")
 
-        print("\n--- SWAG 预测 [test_ood] ---")
+        print("\n--- SWAG predict [test_ood] ---")
         ood_loader = get_ood_loader(cfg, root)
         results = predict_swag(model, swag, ood_loader,
                                n_samples=n_samples, scale=scale, device=device)
         save_results(results, root, "test_ood")
 
-        print("\nSWAG 推理完成！")
+        print("\nSWAG inference done.")
 
 
 if __name__ == "__main__":

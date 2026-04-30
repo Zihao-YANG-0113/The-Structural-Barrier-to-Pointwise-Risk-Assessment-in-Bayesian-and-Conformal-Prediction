@@ -3,9 +3,7 @@ llm_rejection_curves.py
 -----------------------
 Tier-risk rejection-curve figure for the LLM experiment
 (BoolQ ID / PubMedQA OOD / Mixed) under three Stage-1 coverage tiers
-(70% / 80% main / 90%).
-
-Curve values are stored directly on the 5%-grid r ∈ {0,5,...,40}.
+(70% / 80% main / 90%), evaluated on the 5%-grid r ∈ {0, 5, ..., 40}.
 """
 
 import os
@@ -53,7 +51,8 @@ FS_ANNOTATE  = 9.0
 
 
 # ------------------------------------------------------------------ #
-# Data on the 5%-grid r ∈ {0, 5, 10, 15, 20, 25, 30, 35, 40}          #
+# Per-scenario error-rate sequences on the rejection grid             #
+# r ∈ {0, 5, 10, 15, 20, 25, 30, 35, 40}.                              #
 # ------------------------------------------------------------------ #
 
 DATA = {

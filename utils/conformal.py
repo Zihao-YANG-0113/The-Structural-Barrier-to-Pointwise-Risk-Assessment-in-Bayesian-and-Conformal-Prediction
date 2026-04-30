@@ -1,17 +1,18 @@
 """
 conformal.py
 ------------
-Split Conformal Prediction，使用 APS（Adaptive Prediction Sets）评分。
+Split Conformal Prediction with the APS (Adaptive Prediction Sets) score.
 
-APS 评分：对于样本 (x, y)，
-  score = cumulative softmax probability up to and including true class y
-  (按概率从大到小排序后的累积和)
+APS score: for a sample (x, y),
+  score = cumulative softmax probability up to and including the true class y
+  (sorted descending and accumulated).
 
-校准：在 calibration set 计算所有 APS score，取 ⌈(n+1)(1-α)⌉/n 分位数 q̂。
-预测：预测集 = {y : APS_score(x, y) ≤ q̂}
+Calibration: compute every APS score on the calibration set and take the
+⌈(n+1)(1-α)⌉/n quantile q̂.
+Prediction: prediction set = {y : APS_score(x, y) ≤ q̂}.
 
-用法：
-    python methods/conformal.py --config configs/default.yaml --method llla
+Usage:
+    python utils/conformal.py --config configs/default.yaml --method llla
 """
 
 import argparse
@@ -24,8 +25,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.splits import get_loaders, get_ood_loader
-from models.backbone import load_model
+from utils.splits import get_loaders, get_ood_loader
+from utils.backbone import load_model
 
 
 def load_config(path: str) -> dict:
@@ -34,56 +35,51 @@ def load_config(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  APS 评分                                                            #
+#  APS score                                                          #
 # ------------------------------------------------------------------ #
 
 def aps_scores(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    计算每个样本的 APS 评分。
-    probs:  (N, C) softmax 概率
-    labels: (N,)   真实标签
-    返回:  (N,)   APS 分数 ∈ [0, 1]
-    """
+    """Per-sample APS score.
+    probs:  (N, C) softmax probabilities
+    labels: (N,)   true labels
+    returns: (N,)  APS score in [0, 1]"""
     N, C = probs.shape
     sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)  # (N, C)
     cumsum = sorted_probs.cumsum(dim=-1)                              # (N, C)
 
     scores = torch.zeros(N)
     for i in range(N):
-        # 找到真实标签在排序中的位置
+        # Position of the true label in the sort
         rank = (sorted_idx[i] == labels[i]).nonzero(as_tuple=True)[0].item()
         scores[i] = cumsum[i, rank].item()
     return scores
 
 
 def aps_scores_batch(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """
-    向量化版 APS 评分（更快）。
-    """
+    """Vectorised APS score (faster)."""
     sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
     cumsum = sorted_probs.cumsum(dim=-1)
 
-    # 对每个样本找真实标签的排名
+    # Rank of the true label per sample
     label_expand = labels.unsqueeze(1).expand_as(sorted_idx)    # (N, C)
     match_mask   = (sorted_idx == label_expand)                  # (N, C) bool
-    # 取第一个匹配位置
+    # First match
     ranks = match_mask.float().argmax(dim=-1)                    # (N,)
     scores = cumsum[torch.arange(len(labels)), ranks]            # (N,)
     return scores
 
 
 def prediction_sets_from_scores(probs: torch.Tensor, quantile: float) -> list[list[int]]:
-    """
-    根据量化分位数生成预测集。
-    对每个样本，收集所有满足 cumsum ≤ quantile 的类别
-    （但至少包含第一个类别，即最高概率类别）。
-    """
+    """Generate prediction sets from a calibration quantile.
+    For each sample, collect classes whose cumulative probability does not
+    exceed the quantile (always including at least the top class)."""
     sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
     cumsum = sorted_probs.cumsum(dim=-1)
     pred_sets = []
     for i in range(probs.shape[0]):
         included = (cumsum[i] <= quantile).nonzero(as_tuple=True)[0]
-        # 找第一个超过分位数的位置（以确保真实类包含进来的概率 ≥ 1-α）
+        # First position whose cumulative prob exceeds the quantile (so the
+        # true class is included with probability ≥ 1-α).
         exceed = (cumsum[i] > quantile).nonzero(as_tuple=True)[0]
         if len(exceed) == 0:
             cutoff = probs.shape[1] - 1
@@ -95,39 +91,35 @@ def prediction_sets_from_scores(probs: torch.Tensor, quantile: float) -> list[li
 
 
 # ------------------------------------------------------------------ #
-#  校准 & 预测                                                         #
+#  Calibration & prediction                                          #
 # ------------------------------------------------------------------ #
 
 class SplitConformal:
-    """
-    Split Conformal Predictor（APS 评分）。
-    """
+    """Split conformal predictor with APS scores."""
     def __init__(self, alpha: float = 0.1):
         self.alpha    = alpha
         self.quantile = None
 
     def calibrate(self, cal_probs: torch.Tensor, cal_labels: torch.Tensor):
-        """
-        在 calibration set 上估计分位数 q̂。
+        """Estimate the quantile q̂ on the calibration set.
         cal_probs:  (n, C)
-        cal_labels: (n,)
-        """
+        cal_labels: (n,)"""
         scores = aps_scores_batch(cal_probs, cal_labels)
         n      = len(scores)
         level  = np.ceil((n + 1) * (1 - self.alpha)) / n
         level  = min(level, 1.0)
         self.quantile = float(torch.quantile(scores, level))
-        print(f"Conformal 分位数 q̂ = {self.quantile:.4f}  (α={self.alpha}, n={n})")
+        print(f"Conformal quantile q̂ = {self.quantile:.4f}  (α={self.alpha}, n={n})")
         return self.quantile
 
     def predict(self, test_probs: torch.Tensor) -> list[list[int]]:
-        """返回每个测试样本的预测集（类别索引列表）。"""
+        """Return the prediction set (list of class indices) for each test sample."""
         if self.quantile is None:
-            raise RuntimeError("请先调用 calibrate()。")
+            raise RuntimeError("Call calibrate() first.")
         return prediction_sets_from_scores(test_probs, self.quantile)
 
     def coverage(self, pred_sets: list[list[int]], labels: torch.Tensor) -> float:
-        """计算经验覆盖率。"""
+        """Empirical coverage rate."""
         covered = sum(
             1 for ps, y in zip(pred_sets, labels.tolist()) if y in ps
         )
@@ -138,30 +130,29 @@ class SplitConformal:
 
 
 # ------------------------------------------------------------------ #
-#  加载各方法的预测概率                                                #
+#  Load saved predictive probabilities                                #
 # ------------------------------------------------------------------ #
 
 def load_probs(root: str, method: str, split: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """从已保存的方法结果中加载 probs 和 labels。"""
+    """Load the saved probs / labels produced by the chosen method."""
     path = os.path.join(root, "results", method, f"{split}.pt")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"未找到 {path}，请先运行对应方法。")
+        raise FileNotFoundError(f"Could not find {path}. Run the corresponding method first.")
     data = torch.load(path, weights_only=False)
     return data["probs"], data["labels"]
 
 
 # ------------------------------------------------------------------ #
-#  运行 & 保存                                                         #
+#  Run & save                                                         #
 # ------------------------------------------------------------------ #
 
 def run_conformal(root: str, cfg: dict, method: str = "llla"):
-    """
-    对指定方法运行 split conformal，保存预测集和覆盖率。
-    """
+    """Run split conformal for the given method and save prediction sets
+    + coverage."""
     alpha = cfg.get("alpha", 0.1)
     cp    = SplitConformal(alpha=alpha)
 
-    # 校准
+    # Calibrate
     cal_probs, cal_labels = load_probs(root, method, "calibration")
     cp.calibrate(cal_probs, cal_labels)
 
@@ -171,9 +162,9 @@ def run_conformal(root: str, cfg: dict, method: str = "llla"):
         pred_sets = cp.predict(test_probs)
         cov       = cp.coverage(pred_sets, test_labels)
         avg_size  = cp.avg_set_size(pred_sets)
-        print(f"  [{method}|{split}] 覆盖率={cov:.4f}  平均集合大小={avg_size:.2f}")
+        print(f"  [{method}|{split}] coverage={cov:.4f}  avg set size={avg_size:.2f}")
 
-        # APS 分数（用于后续 B_local 校正）
+        # APS scores (used downstream by the B_local audit pipeline)
         aps = aps_scores_batch(test_probs, test_labels)
         results[split] = {
             "pred_sets":  pred_sets,
@@ -190,7 +181,7 @@ def run_conformal(root: str, cfg: dict, method: str = "llla"):
     for split, res in results.items():
         path = os.path.join(save_dir, f"{split}.pt")
         torch.save(res, path)
-        print(f"Conformal 结果已保存: {path}")
+        print(f"Conformal results saved: {path}")
 
     return results
 
@@ -200,7 +191,7 @@ def main():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--method", default="llla",
                         choices=["llla", "ensemble", "mc_dropout"],
-                        help="使用哪个方法的预测概率进行 conformal")
+                        help="Method whose predictive probabilities feed conformal.")
     args = parser.parse_args()
 
     config_path = args.config
@@ -214,7 +205,7 @@ def main():
 
     print(f"=== Split Conformal (APS) with {args.method} ===")
     run_conformal(root, cfg, args.method)
-    print("\nConformal 推理完成！")
+    print("\nConformal inference done.")
 
 
 if __name__ == "__main__":

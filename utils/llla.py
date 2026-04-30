@@ -27,8 +27,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.splits import get_loaders, get_ood_loader
-from models.backbone import load_model
+from utils.splits import get_loaders, get_ood_loader
+from utils.backbone import load_model
 
 
 def load_config(path: str) -> dict:
@@ -37,11 +37,11 @@ def load_config(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  不确定性计算工具                                                    #
+#  Uncertainty helpers                                                #
 # ------------------------------------------------------------------ #
 
 def entropy(probs: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """计算每个样本的预测熵。probs: (N, C)，返回 (N,)。"""
+    """Per-sample predictive entropy. probs: (N, C) → (N,)."""
     return -(probs * (probs + eps).log()).sum(dim=-1)
 
 
@@ -50,11 +50,9 @@ def mutual_information(
     probs_samples: torch.Tensor,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """
-    MI = H[p̄] - E[H[p_θ]]
+    """MI = H[p̄] - E[H[p_θ]]
     mean_probs:    (N, C)
-    probs_samples: (N, S, C)  S 个近似样本
-    """
+    probs_samples: (N, S, C) — S posterior samples."""
     h_mean   = entropy(mean_probs, eps)
     h_per    = -(probs_samples * (probs_samples + eps).log()).sum(dim=-1)  # (N, S)
     e_h_per  = h_per.mean(dim=1)                                            # (N,)
@@ -62,18 +60,16 @@ def mutual_information(
 
 
 # ------------------------------------------------------------------ #
-#  LLLA 推理                                                           #
+#  LLLA inference                                                     #
 # ------------------------------------------------------------------ #
 
 def fit_llla(model, train_loader, device="cuda"):
-    """
-    用 laplace-torch 拟合 Last-Layer Laplace，并优化先验精度。
-    返回 Laplace 对象。
-    """
+    """Fit last-layer Laplace via `laplace-torch` and optimise the prior
+    precision. Returns the Laplace object."""
     try:
         from laplace import Laplace
     except ImportError:
-        raise ImportError("请安装 laplace-torch: pip install laplace-torch")
+        raise ImportError("Install laplace-torch first: pip install laplace-torch")
 
     model = model.to(device)
     model.eval()
@@ -84,31 +80,30 @@ def fit_llla(model, train_loader, device="cuda"):
         subset_of_weights="last_layer",
         hessian_structure="kron",
     )
-    print("拟合 Laplace 近似（last-layer Kron Hessian）...")
+    print("Fitting last-layer Laplace approximation (Kron Hessian)...")
     la.fit(train_loader)
-    print("优化先验精度（marginal likelihood）...")
+    print("Optimising prior precision (marginal likelihood)...")
     la.optimize_prior_precision(method="marglik")
-    print(f"最优先验精度: {la.prior_precision.item():.4f}")
+    print(f"Optimised prior precision: {la.prior_precision.item():.4f}")
     return la
 
 
 @torch.no_grad()
 def predict_llla(la, loader, n_samples: int = 100, device="cuda"):
-    """
-    对 loader 中所有样本进行 LLLA 预测。
-    返回 dict，包含：
-      probs          : (N, C)  均值预测概率
-      pred_entropy   : (N,)    预测熵
-      mutual_info    : (N,)    互信息
-      max_prob       : (N,)    最大概率
-      labels         : (N,)    真实标签
-      correct        : (N,)    bool，是否预测正确
-    """
+    """Run LLLA prediction on every sample in the loader.
+    Returns a dict with:
+      probs          : (N, C) mean predictive probabilities
+      pred_entropy   : (N,)   predictive entropy
+      mutual_info    : (N,)   mutual information
+      max_prob       : (N,)   max-class probability
+      labels         : (N,)   true labels
+      correct        : (N,)   bool, prediction correct or not."""
     all_probs, all_labels = [], []
 
-    for x, y in tqdm(loader, desc="LLLA 预测", leave=False):
+    for x, y in tqdm(loader, desc="LLLA predict", leave=False):
         x = x.to(device)
-        # la() 返回均值预测概率 (B, C)，link_approx='probit' 适合分类
+        # la() returns the mean predictive probs (B, C); link_approx='probit'
+        # is the standard probit link for classification.
         with torch.no_grad():
             p = la(x, link_approx="probit")
         all_probs.append(p.cpu())
@@ -117,17 +112,18 @@ def predict_llla(la, loader, n_samples: int = 100, device="cuda"):
     probs  = torch.cat(all_probs,  dim=0)   # (N, C)
     labels = torch.cat(all_labels, dim=0)   # (N,)
 
-    # 用蒙特卡洛采样估计 MI（从后验采样权重）
-    # laplace-torch 支持 la.predictive_samples
-    print("从后验采样估计互信息（MC 采样）...")
+    # Estimate MI by Monte Carlo sampling from the posterior weights.
+    # `laplace-torch` exposes la.predictive_samples for this.
+    print("Estimating mutual information via posterior MC samples...")
     sample_probs_list = []
-    for x, _ in tqdm(loader, desc="LLLA MC 采样", leave=False):
+    for x, _ in tqdm(loader, desc="LLLA MC samples", leave=False):
         x = x.to(device)
-        # 采样 n_samples 次，每次返回 (B, C)
+        # Draw n_samples per batch; each draw returns a (B, C) tensor.
         s = la.predictive_samples(x, pred_type="glm", n_samples=n_samples)
-        # s: (n_samples, B, C) 或 (B, n_samples, C)，取决于 laplace 版本
+        # s: (n_samples, B, C) or (B, n_samples, C) depending on the
+        # laplace-torch version — normalise to (B, n_samples, C).
         if s.shape[0] == n_samples:
-            s = s.permute(1, 0, 2)  # → (B, n_samples, C)
+            s = s.permute(1, 0, 2)
         sample_probs_list.append(s.cpu())
 
     probs_samples = torch.cat(sample_probs_list, dim=0)  # (N, n_samples, C)
@@ -148,7 +144,7 @@ def predict_llla(la, loader, n_samples: int = 100, device="cuda"):
 
 
 # ------------------------------------------------------------------ #
-#  保存结果                                                            #
+#  Save & load                                                        #
 # ------------------------------------------------------------------ #
 
 def save_results(results: dict, root: str, split: str):
@@ -156,7 +152,7 @@ def save_results(results: dict, root: str, split: str):
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"{split}.pt")
     torch.save(results, path)
-    print(f"LLLA 结果已保存: {path}")
+    print(f"LLLA results saved: {path}")
 
 
 def load_results(root: str, split: str) -> dict:
@@ -165,7 +161,7 @@ def load_results(root: str, split: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  主入口                                                              #
+#  Main entry point                                                   #
 # ------------------------------------------------------------------ #
 
 def main():
@@ -186,32 +182,33 @@ def main():
     ckpt_path = os.path.join(root, cfg.get("checkpoints_dir", "./checkpoints"),
                               "backbone_single.pt")
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"未找到 checkpoint: {ckpt_path}。请先训练 backbone。")
+        raise FileNotFoundError(f"Could not find checkpoint: {ckpt_path}. "
+                                f"Train the backbone first.")
 
     model   = load_model(ckpt_path, device)
     loaders = get_loaders(cfg, root)
 
-    # 拟合 Laplace
+    # Fit Laplace
     la = fit_llla(model, loaders["train"], device)
 
-    # 保存 Laplace 对象
+    # Save Laplace object
     la_save = os.path.join(root, "checkpoints", "llla.pt")
     torch.save(la, la_save)
-    print(f"Laplace 对象已保存: {la_save}")
+    print(f"Laplace object saved: {la_save}")
 
-    # 在各 split 上预测
+    # Predict on each split
     for split in ["val", "calibration", "test_id"]:
-        print(f"\n=== LLLA 预测 [{split}] ===")
+        print(f"\n=== LLLA predict [{split}] ===")
         results = predict_llla(la, loaders[split], device=device)
         save_results(results, root, split)
 
     # OOD
-    print("\n=== LLLA 预测 [test_ood] ===")
+    print("\n=== LLLA predict [test_ood] ===")
     ood_loader = get_ood_loader(cfg, root)
     results    = predict_llla(la, ood_loader, device=device)
     save_results(results, root, "test_ood")
 
-    print("\nLLLA 推理完成！")
+    print("\nLLLA inference done.")
 
 
 if __name__ == "__main__":

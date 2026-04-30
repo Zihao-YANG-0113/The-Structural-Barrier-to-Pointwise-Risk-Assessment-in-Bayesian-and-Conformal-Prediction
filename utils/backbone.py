@@ -44,7 +44,7 @@ from tqdm import tqdm
 import torchvision.models as tv_models
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.splits import get_loaders
+from utils.splits import get_loaders
 
 
 def load_config(path: str) -> dict:
@@ -53,7 +53,7 @@ def load_config(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  模型构建                                                            #
+#  Model construction                                                 #
 # ------------------------------------------------------------------ #
 
 def build_resnet18(num_classes: int = 10, dropout_rate: float = 0.0) -> nn.Module:
@@ -166,7 +166,7 @@ def build_resnet20(num_classes: int = 10, dropout_rate: float = 0.0) -> nn.Modul
 # ------------------------------------------------------------------ #
 
 class _WideBasicBlock(nn.Module):
-    """WideResNet 基本残差块。"""
+    """WideResNet basic residual block."""
     def __init__(self, in_planes, planes, stride=1, dropout_rate=0.0):
         super().__init__()
         self.bn1 = nn.BatchNorm2d(in_planes)
@@ -192,11 +192,9 @@ class _WideBasicBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
-    """
-    WideResNet-d-w for CIFAR-10 (32×32).
-    默认 d=28, w=10 → WideResNet-28-10.
-    特征维度 = 64 * widen_factor (= 640 for w=10).
-    """
+    """WideResNet-d-w for CIFAR-10 (32×32).
+    Defaults d=28, w=10 → WideResNet-28-10.
+    Feature dim = 64 * widen_factor (= 640 for w=10)."""
     def __init__(self, depth=28, widen_factor=10, num_classes=10, dropout_rate=0.0):
         super().__init__()
         assert (depth - 4) % 6 == 0, "depth should be 6n+4"
@@ -214,7 +212,7 @@ class WideResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(nStages[3], num_classes)
 
-        # 记录特征维度（供 feature_extractor 使用）
+        # Expose the feature dim for feature_extractor.py
         self.feat_dim = nStages[3]
 
         for m in self.modules():
@@ -260,7 +258,7 @@ def build_model(cfg: dict, dropout_rate: float = 0.0) -> nn.Module:
 
 
 # ------------------------------------------------------------------ #
-#  训练循环                                                            #
+#  Training loops                                                     #
 # ------------------------------------------------------------------ #
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler=None):
@@ -303,20 +301,19 @@ def evaluate(model, loader, criterion, device):
 
 
 # ------------------------------------------------------------------ #
-#  单模型训练                                                          #
+#  Single-model training                                              #
 # ------------------------------------------------------------------ #
 
 def train_model(cfg: dict, root: str, seed: int, save_name: str,
                 dropout_rate: float = 0.0, use_amp: bool = True):
-    """
-    训练单个 ResNet-18，保存最终 epoch checkpoint。
-    使用余弦退火调度（200 epoch），自然收敛，无需 Val 集早停。
-    """
+    """Train a single backbone and save the final-epoch checkpoint.
+    Uses cosine annealing for 200 epochs; the final epoch is the natural
+    convergence point so no validation early stopping is needed."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}  (seed={seed})")
+    print(f"Device: {device}  (seed={seed})")
 
     loaders = get_loaders(cfg, root)
     model = build_model(cfg, dropout_rate).to(device)
@@ -349,7 +346,8 @@ def train_model(cfg: dict, root: str, seed: int, save_name: str,
                 f"Train Loss {train_loss:.4f} Acc {train_acc:.2f}%"
             )
 
-    # 保存最终 epoch（余弦退火末尾为自然收敛点）
+    # Save the final epoch (the end of cosine annealing is the natural
+    # convergence point).
     torch.save({
         "epoch":        epochs,
         "state_dict":   model.state_dict(),
@@ -358,16 +356,17 @@ def train_model(cfg: dict, root: str, seed: int, save_name: str,
         "seed":         seed,
         "dropout_rate": dropout_rate,
     }, save_path)
-    print(f"训练完成。最终训练准确率: {train_acc:.2f}%  已保存到 {save_path}")
+    print(f"Training done. Final train accuracy: {train_acc:.2f}%  saved to {save_path}")
     return save_path
 
 
 # ------------------------------------------------------------------ #
-#  加载已训练模型（供其他模块使用）                                    #
+#  Load a trained model                                               #
 # ------------------------------------------------------------------ #
 
 def load_model(ckpt_path: str, device="cuda") -> nn.Module:
-    """加载已保存的 checkpoint，根据 cfg 中的 backbone 字段自动选择架构。"""
+    """Load a saved checkpoint; the architecture is selected from the
+    `backbone:` field stored in the checkpoint's cfg."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg  = ckpt["cfg"]
     dr   = ckpt.get("dropout_rate", 0.0)
@@ -378,19 +377,19 @@ def load_model(ckpt_path: str, device="cuda") -> nn.Module:
 
 
 def load_ensemble(root: str, cfg: dict, device="cuda") -> list:
-    """加载 5 个 ensemble 模型，返回模型列表。"""
+    """Load 5 ensemble models and return them as a list."""
     ckpt_dir = os.path.join(root, cfg.get("checkpoints_dir", "./checkpoints"))
     models = []
     for i, seed in enumerate(cfg["ensemble_seeds"]):
         path = os.path.join(ckpt_dir, f"ensemble_{i}_seed{seed}.pt")
         if not os.path.exists(path):
-            raise FileNotFoundError(f"未找到 {path}，请先运行 ensemble 训练。")
+            raise FileNotFoundError(f"Could not find {path}. Train the ensemble first.")
         models.append(load_model(path, device))
     return models
 
 
 # ------------------------------------------------------------------ #
-#  主入口                                                              #
+#  Main entry point                                                   #
 # ------------------------------------------------------------------ #
 
 def main():
@@ -401,9 +400,9 @@ def main():
         choices=["single", "ensemble", "mc_dropout"],
         default="single",
         help=(
-            "single: 训练一个模型（backbone_single）; "
-            "ensemble: 训练 5 个 ensemble 模型; "
-            "mc_dropout: 训练带 dropout 的模型（backbone_mcdropout）"
+            "single: train one model (backbone_single); "
+            "ensemble: train 5 ensemble models; "
+            "mc_dropout: train a dropout model (backbone_mcdropout)."
         ),
     )
     args = parser.parse_args()
@@ -422,7 +421,7 @@ def main():
 
     elif args.mode == "ensemble":
         for i, seed in enumerate(cfg["ensemble_seeds"]):
-            print(f"\n===== 训练 Ensemble 模型 {i+1}/5  seed={seed} =====")
+            print(f"\n===== Training ensemble model {i+1}/5  seed={seed} =====")
             train_model(cfg, root, seed=seed, save_name=f"ensemble_{i}_seed{seed}")
 
     elif args.mode == "mc_dropout":

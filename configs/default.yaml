@@ -29,12 +29,12 @@ mc_samples: 30
 
 # --- Last-Layer SWAG ---
 swag:
-  swa_lr: 0.01          # SWA 阶段的恒定学习率
-  swa_epochs: 40         # SWA 收集 epoch 数
-  max_rank: 20           # 低秩近似的最大秩
-  collect_freq: 1        # 每几个 epoch 收集一次快照
-  n_samples: 30          # 推理时采样次数
-  scale: 1.0             # 采样方差缩放因子
+  swa_lr: 0.01          # constant LR during the SWA collection phase
+  swa_epochs: 40         # number of SWA epochs
+  max_rank: 20           # maximum rank of the low-rank approximation
+  collect_freq: 1        # snapshot every N epochs
+  n_samples: 30          # number of MC samples at inference time
+  scale: 1.0             # scaling factor on the sampling variance
 
 # --- Conformal ---
 alpha: 0.1          # miscoverage level (target coverage = 1 - alpha = 90%)

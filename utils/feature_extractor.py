@@ -1,11 +1,11 @@
 """
 feature_extractor.py
 --------------------
-从训练好的 ResNet-18 中提取倒数第二层（avgpool 后）的 512 维特征向量。
-特征会被缓存到磁盘，避免重复计算。
+Extract penultimate-layer (post-avgpool) features from a trained backbone
+and cache them on disk so that subsequent k-NN queries are cheap.
 
-用法：
-    python models/feature_extractor.py --config configs/default.yaml --model backbone_single
+Usage:
+    python utils/feature_extractor.py --config configs/default.yaml --model backbone_single
 """
 
 import argparse
@@ -18,8 +18,8 @@ import torch.nn as nn
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.splits import get_loaders, get_ood_loader
-from models.backbone import load_model, load_ensemble, build_resnet18
+from utils.splits import get_loaders, get_ood_loader
+from utils.backbone import load_model, load_ensemble, build_resnet18
 
 
 def load_config(path: str) -> dict:
@@ -28,38 +28,34 @@ def load_config(path: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  Hook-based 特征提取                                                 #
+#  Hook-based feature extraction                                      #
 # ------------------------------------------------------------------ #
 
 class FeatureExtractorHook:
-    """
-    通过 forward hook 提取 ResNet-18 avgpool 输出（512 维）。
-    支持批量推理。
-    """
+    """Extract avgpool outputs of a CIFAR backbone via a forward hook
+    (e.g. 64-d for ResNet-20, 512-d for ResNet-18). Batch-friendly."""
     def __init__(self, model: nn.Module, device="cuda"):
         self.model  = model.to(device)
         self.device = device
         self._features = []
-        # 挂载 hook 到 avgpool
+        # Hook on avgpool
         self._handle = model.avgpool.register_forward_hook(self._hook_fn)
 
     def _hook_fn(self, module, input, output):
-        # output: (B, 512, 1, 1) → 压平为 (B, 512)
+        # output: (B, D, 1, 1) → flatten to (B, D)
         self._features.append(output.squeeze(-1).squeeze(-1).detach().cpu())
 
     @torch.no_grad()
     def extract(self, loader) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        遍历 loader，返回 (features, labels)。
-        features: (N, 512)
-        labels:   (N,)
-        """
+        """Iterate over the loader and return (features, labels).
+        features: (N, D)
+        labels:   (N,)"""
         self.model.eval()
         self._features = []
         all_labels = []
-        for x, y in tqdm(loader, desc="提取特征", leave=False):
+        for x, y in tqdm(loader, desc="Extracting features", leave=False):
             x = x.to(self.device)
-            self.model(x)          # forward 触发 hook
+            self.model(x)          # forward triggers the hook
             all_labels.append(y)
         features = torch.cat(self._features, dim=0)
         labels   = torch.cat(all_labels, dim=0)
@@ -70,7 +66,7 @@ class FeatureExtractorHook:
 
 
 # ------------------------------------------------------------------ #
-#  缓存管理                                                            #
+#  Cache management                                                   #
 # ------------------------------------------------------------------ #
 
 def _cache_path(root: str, model_name: str, split: str) -> str:
@@ -88,56 +84,54 @@ def extract_and_cache(
     splits=("train", "holdout", "calibration", "test_id"),
     ood_loader=None,
 ) -> dict:
-    """
-    对指定 splits 提取特征并缓存到磁盘。
-    返回 {split: {"features": Tensor, "labels": Tensor}}。
-    """
+    """Extract features for the given splits and cache them on disk.
+    Returns {split: {"features": Tensor, "labels": Tensor}}."""
     extractor = FeatureExtractorHook(model, device)
     results = {}
 
     for split in splits:
         cache = _cache_path(root, model_name, split)
         if os.path.exists(cache):
-            print(f"  [{split}] 已有缓存，加载中...")
+            print(f"  [{split}] cache hit, loading...")
             results[split] = torch.load(cache, weights_only=True)
             continue
-        print(f"  [{split}] 提取特征...")
+        print(f"  [{split}] extracting features...")
         feats, labels = extractor.extract(loaders[split])
         data = {"features": feats, "labels": labels}
         torch.save(data, cache)
         results[split] = data
-        print(f"  [{split}] 特征形状: {feats.shape}  已保存到 {cache}")
+        print(f"  [{split}] feature shape: {feats.shape}  saved to {cache}")
 
     if ood_loader is not None:
         split = "test_ood"
         cache = _cache_path(root, model_name, split)
         if os.path.exists(cache):
-            print(f"  [{split}] 已有缓存，加载中...")
+            print(f"  [{split}] cache hit, loading...")
             results[split] = torch.load(cache, weights_only=True)
         else:
-            print(f"  [{split}] 提取特征...")
+            print(f"  [{split}] extracting features...")
             feats, labels = extractor.extract(ood_loader)
             data = {"features": feats, "labels": labels}
             torch.save(data, cache)
             results[split] = data
-            print(f"  [{split}] 特征形状: {feats.shape}")
+            print(f"  [{split}] feature shape: {feats.shape}")
 
     extractor.close()
     return results
 
 
 def load_cached_features(root: str, model_name: str, split: str) -> dict:
-    """加载已缓存的特征，返回 {"features": Tensor, "labels": Tensor}。"""
+    """Load a cached feature file. Returns {"features": Tensor, "labels": Tensor}."""
     cache = _cache_path(root, model_name, split)
     if not os.path.exists(cache):
         raise FileNotFoundError(
-            f"未找到特征缓存 {cache}。请先运行 feature_extractor.py。"
+            f"Could not find feature cache {cache}. Run feature_extractor.py first."
         )
     return torch.load(cache, weights_only=True)
 
 
 # ------------------------------------------------------------------ #
-#  Ensemble 特征：取 5 个模型特征的均值                                #
+#  Auxiliary: ImageNet pretrained features (for the B̂_local ablation) #
 # ------------------------------------------------------------------ #
 
 def extract_imagenet_pretrained_features(
@@ -146,32 +140,29 @@ def extract_imagenet_pretrained_features(
     device="cuda",
     ood_loader=None,
 ) -> dict:
-    """
-    用 ImageNet 预训练 ResNet-18（冻结，不需训练）提取特征。
-    缓存以 "imagenet_pretrained" 为 model_name。
-    用于 B̂_local 消融：比较主模型特征 vs ImageNet 预训练特征。
-    """
+    """Extract features from a frozen ImageNet-pretrained ResNet-18.
+    Cached under model_name = "imagenet_pretrained". Used by the B̂_local
+    ablation that compares the audited backbone's own features against
+    ImageNet pretrained ones."""
     import torchvision.models as tv_models
 
     model_name = "imagenet_pretrained"
-    # 检查是否已完整缓存
     splits = ("holdout", "test_id", "calibration")
     all_cached = all(
         os.path.exists(_cache_path(root, model_name, s)) for s in splits
     )
     if all_cached:
-        print("imagenet_pretrained 特征已全部缓存，直接加载。")
+        print("imagenet_pretrained features fully cached, loading from disk.")
         results = {s: load_cached_features(root, model_name, s) for s in splits}
         if ood_loader is not None and os.path.exists(_cache_path(root, model_name, "test_ood")):
             results["test_ood"] = load_cached_features(root, model_name, "test_ood")
         return results
 
-    # 加载 ImageNet 预训练权重，移除分类头（只要 512 维特征）
     pretrained = tv_models.resnet18(weights="IMAGENET1K_V1")
     pretrained.fc = nn.Identity()
     pretrained = pretrained.to(device)
     pretrained.eval()
-    print("使用 ImageNet 预训练 ResNet-18 提取特征（冻结，无微调）")
+    print("Using a frozen ImageNet-pretrained ResNet-18 to extract features.")
 
     return extract_and_cache(
         pretrained, loaders, root, model_name, device,
@@ -188,25 +179,21 @@ def extract_ensemble_features(
     splits=("train", "holdout", "calibration", "test_id"),
     ood_loader=None,
 ) -> dict:
-    """
-    逐个提取 5 个 ensemble 模型的特征，然后取均值。
-    缓存以 "ensemble_mean" 为 model_name。
-    """
+    """Extract features from each of the 5 ensemble members and average
+    them. Cached under model_name = "ensemble_mean"."""
     model_name = "ensemble_mean"
-    # 先检查是否已有完整缓存
     all_cached = all(
         os.path.exists(_cache_path(root, model_name, s)) for s in splits
     )
     if all_cached:
-        print("ensemble_mean 特征已全部缓存，直接加载。")
+        print("ensemble_mean features fully cached, loading from disk.")
         return {s: load_cached_features(root, model_name, s) for s in splits}
 
-    # 逐模型提取，累积后取均值
     feature_accum = {s: None for s in splits}
     labels_store  = {s: None for s in splits}
 
     for idx, m in enumerate(models):
-        print(f"  Ensemble 模型 {idx+1}/{len(models)} 提取特征...")
+        print(f"  Ensemble model {idx+1}/{len(models)} extracting features...")
         extractor = FeatureExtractorHook(m, device)
         for split in splits:
             feats, labels = extractor.extract(loaders[split])
@@ -224,22 +211,23 @@ def extract_ensemble_features(
         cache = _cache_path(root, model_name, split)
         torch.save(data, cache)
         results[split] = data
-        print(f"  [{split}] ensemble_mean 特征形状: {mean_feats.shape}")
+        print(f"  [{split}] ensemble_mean feature shape: {mean_feats.shape}")
 
     return results
 
 
 # ------------------------------------------------------------------ #
-#  主入口                                                              #
+#  Main entry point                                                   #
 # ------------------------------------------------------------------ #
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config",  default="configs/default.yaml")
     parser.add_argument("--model",   default="backbone_single",
-                        help="checkpoint 名称（不含 .pt 后缀）")
+                        help="Checkpoint name (no .pt suffix).")
     parser.add_argument("--all",     action="store_true",
-                        help="提取所有模型（single + ensemble + reference）的特征")
+                        help="Extract features for every model "
+                             "(single + ensemble + reference).")
     args = parser.parse_args()
 
     config_path = args.config
@@ -267,13 +255,13 @@ def main():
     for name in model_names:
         ckpt_path = os.path.join(ckpt_dir, f"{name}.pt")
         if not os.path.exists(ckpt_path):
-            print(f"[跳过] 未找到 checkpoint: {ckpt_path}")
+            print(f"[skip] checkpoint not found: {ckpt_path}")
             continue
-        print(f"\n=== 提取特征: {name} ===")
+        print(f"\n=== Extracting features: {name} ===")
         model = load_model(ckpt_path, device)
         extract_and_cache(model, loaders, root, name, device, ood_loader=ood_loader)
 
-    print("\n特征提取完成！")
+    print("\nFeature extraction done.")
 
 
 if __name__ == "__main__":

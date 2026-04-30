@@ -1,10 +1,11 @@
 """
 splits.py
 ---------
-提供加载各数据分割的 DataLoader 工厂函数。
-所有脚本通过此模块获取一致的数据集，避免分割泄漏。
+DataLoader factory for the various data splits.
+All scripts go through this module so that the splits stay consistent
+and never leak across train / hold-out / calibration / test_id.
 
-CIFAR-10 归一化参数（在完整训练集上计算）：
+CIFAR-10 normalisation (computed on the full training set):
   mean = (0.4914, 0.4822, 0.4465)
   std  = (0.2023, 0.1994, 0.2010)
 """
@@ -17,7 +18,7 @@ import torchvision
 import torchvision.transforms as T
 
 
-# ---------- CIFAR-10 标准归一化 ----------
+# ---------- CIFAR-10 standard normalisation ----------
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
@@ -33,7 +34,7 @@ _EVAL_TRANSFORM = T.Compose([
     T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
 ])
 
-# SVHN 归一化（ImageNet 统计近似即可）
+# SVHN normalisation (CIFAR-10 stats are a fine approximation here).
 _SVHN_TRANSFORM = T.Compose([
     T.Resize(32),
     T.ToTensor(),
@@ -45,21 +46,20 @@ def _load_splits(splits_dir: str) -> dict:
     path = os.path.join(splits_dir, "splits.npz")
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"找不到分割文件 {path}。请先运行 data/prepare_data.py。"
+            f"Could not find split file {path}. Run data/prepare_data.py first."
         )
     data = np.load(path)
     return {k: data[k] for k in data.files}
 
 
 def get_loaders(cfg: dict, root: str, batch_size: int = None, num_workers: int = 4):
-    """
-    返回 dict，包含各数据分割的 DataLoader：
-      - train       : 带 augmentation（40,000）
-      - holdout     : 无 augmentation（5,000，用于 B̂_local）
-      - calibration : 无 augmentation（5,000，分位数校准）
-      - test_id     : 无 augmentation（5,000，ID 测试）
-    注：无 Val 集，backbone 用余弦退火收敛，保存最终 epoch。
-    """
+    """Return a dict with one DataLoader per split:
+      - train       : with augmentation (40,000)
+      - holdout     : no augmentation (5,000) — feeds B̂_local
+      - calibration : no augmentation (5,000) — quantile calibration
+      - test_id     : no augmentation (5,000) — ID test set
+    No validation split: the backbone is trained with cosine annealing
+    and the final-epoch checkpoint is the natural convergence point."""
     data_dir   = os.path.join(root, cfg.get("data_dir", "./data/raw"))
     splits_dir = os.path.join(root, "data")
     bs = batch_size or cfg.get("batch_size", 128)
@@ -102,13 +102,13 @@ def get_loaders(cfg: dict, root: str, batch_size: int = None, num_workers: int =
 
 
 def get_ood_loader(cfg: dict, root: str, batch_size: int = None, num_workers: int = 4):
-    """返回 SVHN 测试集 DataLoader（OOD 评估）。"""
+    """Return the SVHN test loader for OOD evaluation."""
     data_dir = os.path.join(root, cfg.get("data_dir", "./data/raw"))
     bs = batch_size or cfg.get("batch_size", 128)
     dataset = torchvision.datasets.SVHN(
         root=data_dir, split='test', download=False, transform=_SVHN_TRANSFORM
     )
-    # 取前 5000 以匹配 ID test 集大小
+    # Take the first 5000 to match the ID test set size.
     subset = Subset(dataset, list(range(5000)))
     return DataLoader(subset, batch_size=bs, shuffle=False,
                       num_workers=num_workers, pin_memory=True)
@@ -116,11 +116,10 @@ def get_ood_loader(cfg: dict, root: str, batch_size: int = None, num_workers: in
 
 def get_cifar10c_loader(cfg: dict, root: str, corruption: str, severity: int,
                          batch_size: int = None, num_workers: int = 4):
-    """
-    返回单个 CIFAR-10-C 腐蚀类型+严重程度的 DataLoader。
-    CIFAR-10-C 文件结构：每个腐蚀类型一个 .npy 文件，共 10,000*5 张图。
-    labels.npy 共 50,000 个标签（每个严重程度 10,000 张顺序叠加）。
-    """
+    """Return a DataLoader for one CIFAR-10-C corruption + severity.
+    CIFAR-10-C layout: one .npy per corruption containing 10,000 × 5 = 50,000
+    images, with labels.npy holding 50,000 labels (severities are concatenated
+    in order)."""
     from torch.utils.data import TensorDataset
 
     cifar10c_dir = os.path.join(root, cfg.get("cifar10c_dir", "./data/raw/CIFAR-10-C"))
@@ -130,18 +129,19 @@ def get_cifar10c_loader(cfg: dict, root: str, corruption: str, severity: int,
     labels_path = os.path.join(cifar10c_dir, "labels.npy")
 
     if not os.path.exists(images_path):
-        raise FileNotFoundError(f"未找到 {images_path}，请手动下载 CIFAR-10-C。")
+        raise FileNotFoundError(f"Could not find {images_path}. "
+                                f"Download CIFAR-10-C manually.")
 
     images = np.load(images_path)   # (50000, 32, 32, 3), uint8
     labels = np.load(labels_path)   # (50000,), int64
 
-    # severity 1~5，每段 10000 张
+    # Severities 1..5, 10,000 images each.
     start = (severity - 1) * 10000
     end   = severity * 10000
     imgs  = images[start:end]       # (10000, 32, 32, 3)
     lbls  = labels[start:end]
 
-    # 归一化
+    # Normalise
     mean = torch.tensor(CIFAR10_MEAN).view(3, 1, 1)
     std  = torch.tensor(CIFAR10_STD).view(3, 1, 1)
     imgs_tensor = torch.from_numpy(imgs).permute(0, 3, 1, 2).float() / 255.0
@@ -153,10 +153,8 @@ def get_cifar10c_loader(cfg: dict, root: str, corruption: str, severity: int,
 
 
 def collect_features_and_labels(loader, device="cuda"):
-    """
-    辅助函数：遍历 loader，返回 (images_tensor, labels_tensor)。
-    用于特征提取前的批量收集。
-    """
+    """Helper: iterate over a loader and return (images_tensor, labels_tensor).
+    Used to batch-collect inputs prior to feature extraction."""
     all_x, all_y = [], []
     for x, y in loader:
         all_x.append(x)

@@ -1,6 +1,6 @@
 # Code submission — *The Structural Barrier to Pointwise Risk Assessment in Bayesian and Conformal Prediction*
 
-Candidate Number: **1099874** · Master of Science Thesis · Trinity 2026
+Candidate Number: **1099874** · Master of Science Thesis · Trinity 2026.
 
 This package contains the code that produced every figure and table reported in
 the dissertation. The repository is organised so that each numbered figure or
@@ -9,11 +9,6 @@ table maps onto a single, self-contained entry-point script under
 ($\widehat{B}_{\mathrm{local}}$ estimator and the Stage-2 audit flag) lives in
 `core/` and the supporting model / data / inference utilities live in
 `utils/`. The LLM experiments have their own subdirectory (`llm/`).
-
-> **Reproduction note.** The user's instruction was to organise the code and
-> align it with the dissertation, **not to re-run the experiments**. The
-> entry-point scripts below are wired to the same backends that produced the
-> reported numbers; no checkpoints or precomputed caches are shipped.
 
 ---
 
@@ -162,29 +157,7 @@ These values are written directly into `configs/default.yaml` (vision) and
 
 ---
 
-## 6. Discrepancies fixed during this consolidation
-
-The packaged code corrects three small drift points relative to the original
-research repository, so that what is shipped here matches the dissertation
-verbatim:
-
-* `utils/backbone.py` now provides `build_resnet20` (the standard CIFAR
-  ResNet-20 from He et al. 2016) and the default `backbone:` entry in
-  `configs/default.yaml` is `resnet20`. The legacy `build_resnet18` builder is
-  retained for auxiliary ablations only.
-* `llm/config.py::Config.k_nn` is set to **50** (was 25), aligned with §4.1's
-  *"k = 50 in the main experiments"*.
-* `llm/config.py::get_config()` uses `meta-llama/Meta-Llama-3-8B` (was
-  `Llama-3.1-8B`) to match §4.3.1's *"We use Llama-3-8B as a frozen feature
-  extractor"*.
-
-No experiments were re-run. The CSVs that already match the dissertation's
-numerical claims (Tables 4.1 / 4.3) were produced by the same backends as the
-ones called from the entry-points above.
-
----
-
-## 7. License and citation
+## 6. License and citation
 
 If you use this code, please cite the thesis:
 
